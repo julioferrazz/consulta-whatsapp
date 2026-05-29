@@ -8,12 +8,12 @@ REDIS_PASSWORD = None       # None = sem senha; coloque a senha aqui se houver
 
 # ── API Node.js ──────────────────────────────────────────────────────────────
 NODE_API_URL  = 'http://localhost:3000'
-NUM_SESSIONS  = 2           # deve ser igual ao NUM_SESSIONS no index.js
+NUM_SESSIONS  = 1           # deve ser igual ao NUM_SESSIONS no index.js
 
 # ── Controle de taxa ─────────────────────────────────────────────────────────
 MAX_RPS      = 1            # maximo de consultas por segundo (total, todos workers)
-BATCH_SIZE   = 120          # quantidade de consultas ate o delay obrigatorio
-BATCH_DELAY  = 30           # segundos de pausa a cada BATCH_SIZE consultas
+BATCH_SIZE   = 100          # quantidade de consultas ate o delay obrigatorio
+BATCH_DELAY  = 20           # segundos de pausa a cada BATCH_SIZE consultas
 
 # ── Chaves Redis ─────────────────────────────────────────────────────────────
 QUEUE_KEY    = 'wa:queue'   # lista (FIFO) de numeros pendentes

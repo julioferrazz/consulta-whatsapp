@@ -18,6 +18,7 @@ O script faz tudo em ordem:
 
 import sys
 import os
+import random
 import time
 import threading
 
@@ -199,6 +200,9 @@ class Worker:
 
             # ── Chama a API Node.js ───────────────────────────────────────
             self._consultar(numero)
+
+            delay = random.uniform(1.5, 4.0)
+            time.sleep(delay)
 
             # ── Incrementa contador e verifica delay de lote ─────────────
             total = self._gerenciador.incrementar_contador()

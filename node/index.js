@@ -29,7 +29,7 @@ const pino = require('pino');
 // Configuracoes
 // ---------------------------------------------------------------------------
 const PORT = 3000;
-const NUM_SESSIONS = 2;
+const NUM_SESSIONS = 1;
 const SESSIONS_DIR = path.join(__dirname, 'sessions');
 
 // ---------------------------------------------------------------------------
