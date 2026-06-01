@@ -3,7 +3,7 @@
 /**
  * index.js — Servidor WhatsApp Checker
  *
- * Gerencia 3 sessoes do WhatsApp via Baileys e expoe uma API HTTP
+ * Gerencia sessoes do WhatsApp via Baileys e expoe uma API HTTP
  * para que o Python consulte se um numero possui conta no WhatsApp.
  *
  * Endpoints:
@@ -29,7 +29,7 @@ const pino = require('pino');
 // Configuracoes
 // ---------------------------------------------------------------------------
 const PORT = 3000;
-const NUM_SESSIONS = 1;
+const NUM_SESSIONS = 2;
 const SESSIONS_DIR = path.join(__dirname, 'sessions');
 
 // ---------------------------------------------------------------------------

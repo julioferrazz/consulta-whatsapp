@@ -26,15 +26,18 @@ import redis
 import openpyxl
 import requests
 
+PAUSE_LOCK = threading.Lock()
+PAUSE_EVENT = threading.Event()
+
 # Garante que config.py seja encontrado mesmo rodando de outro diretorio
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import (
     REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_PASSWORD,
     NODE_API_URL, NUM_SESSIONS,
     MAX_RPS, BATCH_SIZE, BATCH_DELAY,
-    QUEUE_KEY, RESULTS_KEY, COUNTER_KEY, RPS_PREFIX,
+    QUEUE_KEY, RESULTS_KEY, COUNTER_KEY, RPS_PREFIX, MAX_RETRIES
 )
-
+barrier = threading.Barrier(NUM_SESSIONS)
 
 # ============================================================================
 # Classe: GerenciadorRedis
@@ -68,9 +71,9 @@ class GerenciadorRedis:
     def tamanho_fila(self) -> int:
         return self._client.llen(QUEUE_KEY)
 
-    def reenfileirar(self, numero: str):
-        """Coloca o numero de volta no final da fila (em caso de falha)."""
-        self._client.rpush(QUEUE_KEY, numero)
+    def reenfileirar(self, numero: str, tentativas: int):
+        if tentativas < MAX_RETRIES:
+            self._client.rpush(QUEUE_KEY, f"{numero}:{tentativas+1}")
 
     def adicionar_resultado(self, numero: str):
         self._client.sadd(RESULTS_KEY, numero)
@@ -136,7 +139,7 @@ class CarregadorExcel:
             raw    = str(row[0]).strip()
             numero = ''.join(c for c in raw if c.isdigit())
             if numero:
-                self._gerenciador.enfileirar(numero)
+                self._gerenciador.enfileirar(f"{numero}:0")
                 count += 1
 
         wb.close()
@@ -177,36 +180,58 @@ class SalvadorExcel:
 # ============================================================================
 class Worker:
 
-    def __init__(self, session_id: int, gerenciador: GerenciadorRedis, stop_event: threading.Event):
+    def __init__(self, session_id: int, gerenciador: GerenciadorRedis, stop_event: threading.Event, total: int):
         self._session_id  = session_id
         self._gerenciador = gerenciador
         self._stop_event  = stop_event
+        self._total = total
 
     def executar(self):
         print(f'[Worker {self._session_id}] Iniciado.')
 
         while not self._stop_event.is_set():
-            numero = self._gerenciador.desenfileirar()
+            # ── Pega um número do Redis (bloqueante, timeout 2s) ───────────────
+            item = self._gerenciador.client.blpop(QUEUE_KEY, timeout=2)
+            if item is None:
+                # Fila vazia -> encerra
+                break
+            numero_com_tentativas = item[1]
+            numero, tentativas = numero_com_tentativas.split(":")
+            tentativas = int(tentativas)
 
-            # Fila vazia -> encerra
-            if numero is None:
-                if self._gerenciador.tamanho_fila() == 0:
-                    break
-                time.sleep(0.5)
-                continue
-
-            # ── Adquire slot de rate-limit ────────────────────────────────
+            # ── Adquire slot de rate-limit global ───────────────────────────────
             self._gerenciador.adquirir_slot_rps()
 
-            # ── Chama a API Node.js ───────────────────────────────────────
+            # ── Chama a API Node.js, incrementa contador ───────────────────────
             self._consultar(numero)
 
+            total = self._gerenciador.incrementar_contador()
+            restantes = self._total - total
+
+            with PAUSE_LOCK:
+                print(f'[Worker {self._session_id}] Progresso: {total}/{self._total}  | {restantes} Restantes')
+
+            # ── Delay aleatório entre requests para simular comportamento humano ──
             delay = random.uniform(1.5, 4.0)
             time.sleep(delay)
 
-            # ── Incrementa contador e verifica delay de lote ─────────────
-            total = self._gerenciador.incrementar_contador()
-            self._verificar_delay_lote(total)
+            # ── Pausa global a cada BATCH_SIZE consultas ────────────────────────
+            if total > 0 and total % BATCH_SIZE == 0:
+                if PAUSE_LOCK.acquire(blocking=False):
+                    try:
+                        # Sinaliza que a pausa começou
+                        PAUSE_EVENT.set()
+                        with PAUSE_LOCK:
+                            print(f'\n[Sistema] {total} consultas realizadas -> pausa de {BATCH_DELAY}s...\n')
+                        time.sleep(BATCH_DELAY)
+                        # Fim da pausa
+                        PAUSE_EVENT.clear()
+                    finally:
+                        PAUSE_LOCK.release()
+                else:
+                    # Outras threads aguardam até a pausa terminar
+                    while PAUSE_EVENT.is_set():
+                        time.sleep(0.1)
 
         print(f'[Worker {self._session_id}] Encerrado.')
 
@@ -251,10 +276,21 @@ class Worker:
             time.sleep(2)
 
     @staticmethod
-    def _verificar_delay_lote(total: int):
+    def _verificar_delay_lote(self, total: int):
         if total > 0 and total % BATCH_SIZE == 0:
-            print(f'\n[Sistema] {total} consultas realizadas -> pausa de {BATCH_DELAY}s...\n')
-            time.sleep(BATCH_DELAY)
+            if PAUSE_LOCK.acquire(blocking=False):
+                try:
+                    print(f'\n[Sistema] {total} consultas realizadas -> pausa de {BATCH_DELAY}s...\n')
+                    PAUSE_EVENT.set()        # sinaliza para todas as threads pausarem
+                    time.sleep(BATCH_DELAY)  # pausa efetiva
+                    PAUSE_EVENT.clear()      # libera as threads
+                finally:
+                    PAUSE_LOCK.release()
+            else:
+                # Outras threads aguardam a pausa terminar
+                while PAUSE_EVENT.is_set():
+                    time.sleep(0.1)
+
 
 
 # ============================================================================
@@ -284,7 +320,7 @@ class Orquestrador:
         stop_event = threading.Event()
         threads    = []
         for i in range(num_workers):
-            worker = Worker(i, self._gerenciador, stop_event)
+            worker = Worker(i, self._gerenciador, stop_event, total)
             t = threading.Thread(target=worker.executar, daemon=True)
             threads.append(t)
             t.start()
