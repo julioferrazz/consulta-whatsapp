@@ -20,10 +20,16 @@ const {
 } = require('@whiskeysockets/baileys');
 
 const express = require('express');
-const qrcode = require('qrcode-terminal');
 const path = require('path');
 const fs = require('fs');
 const pino = require('pino');
+
+// Se não instalado, exibe apenas o texto do QR no console.
+let qrcode = null;
+try {
+  qrcode = require('qrcode-terminal');
+} catch (_) {
+}
 
 // ---------------------------------------------------------------------------
 // Configuracoes
@@ -79,9 +85,15 @@ async function startSession(id) {
       console.log(`  SESSAO ${id} — Escaneie o QR Code abaixo`);
       console.log('='.repeat(55) + '\n');
 
-      qrcode.generate(qr, { small: true });
+      if (qrcode) {
+        qrcode.generate(qr, { small: true });
+      } else {
+        console.log('[QR] Para exibir o QR visualmente, instale: npm install qrcode-terminal');
+        console.log('[QR] Ou use um aplicativo de leitura de QR com a string abaixo:');
+        console.log(qr);
+      }
 
-      console.log('\n[Aguardando conexão por até 40 segundos...]');
+      console.log('\n[Aguardando conexao por até 40 segundos...]');
     }
 
     if (connection === 'close') {
