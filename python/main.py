@@ -26,10 +26,38 @@ import redis
 import openpyxl
 import requests
 
-# PAUSE_EVENT em estado "limpo" (False) = sem pausa ativa.
-# Quando um worker atinge o BATCH_SIZE, seta o evento (True),
-# dorme BATCH_DELAY segundos e limpa o evento (False) para retomar.
-PAUSE_EVENT = threading.Event()
+# ── Controle de pausa global ─────────────────────────────────────────────────
+#
+# RUNNING_EVENT:
+#   set()   = sistema rodando normalmente  (estado inicial)
+#   clear() = pausa ativa — todos os workers bloqueiam em .wait()
+#
+# PAUSE_LOCK:
+#   Garante que APENAS UM worker dispara a pausa por vez.
+#   Os outros workers que chegarem no checkpoint de batch durante uma pausa
+#   já em andamento simplesmente ignoram (a pausa os cobrirá via wait()).
+#
+# _sleep_interruptivel():
+#   Substitui time.sleep(delay) para que o delay seja abortado
+#   assim que uma pausa começar, sem esperar ele terminar.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+RUNNING_EVENT = threading.Event()
+RUNNING_EVENT.set()  # começa em estado "rodando"
+PAUSE_LOCK = threading.Lock()
+
+
+def _sleep_interruptivel(segundos: float) -> None:
+    """
+    Dorme por `segundos`, mas interrompe imediatamente se o RUNNING_EVENT
+    for limpo (pausa iniciada), sem esperar o tempo restante.
+    """
+    prazo = time.time() + segundos
+    while time.time() < prazo:
+        if not RUNNING_EVENT.is_set():
+            return  # pausa iniciada — sai do sleep antes do tempo
+        time.sleep(0.05)  # granularidade de 50 ms
+
 
 # Garante que config.py seja encontrado mesmo rodando de outro diretorio
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -53,7 +81,6 @@ from config import (
 
 # ============================================================================
 # Classe: GerenciadorRedis
-# Responsabilidade: encapsula a conexao e operacoes atomicas no Redis
 # ============================================================================
 class GerenciadorRedis:
 
@@ -71,25 +98,19 @@ class GerenciadorRedis:
         return self._client
 
     def limpar_estado(self):
-        """Remove todas as chaves de uma execucao anterior."""
         self._client.delete(QUEUE_KEY, RESULTS_KEY, COUNTER_KEY)
 
     def enfileirar(self, numero: str):
         self._client.rpush(QUEUE_KEY, numero)
-
-    def desenfileirar(self) -> str | None:
-        return self._client.lpop(QUEUE_KEY)
 
     def tamanho_fila(self) -> int:
         return self._client.llen(QUEUE_KEY)
 
     def reenfileirar(self, numero: str, tentativas: int):
         if tentativas < MAX_RETRIES:
-            nova_tentativa = tentativas + 1
-            self._client.rpush(QUEUE_KEY, f"{numero}:{nova_tentativa}")
-            print(
-                f"[Redis] {numero} reenfileirado (tentativa {nova_tentativa}/{MAX_RETRIES})"
-            )
+            nova = tentativas + 1
+            self._client.rpush(QUEUE_KEY, f"{numero}:{nova}")
+            print(f"[Redis] {numero} reenfileirado (tentativa {nova}/{MAX_RETRIES})")
         else:
             print(f"[Redis] {numero} descartado após {MAX_RETRIES} tentativas")
 
@@ -99,18 +120,11 @@ class GerenciadorRedis:
     def obter_resultados(self) -> set:
         return self._client.smembers(RESULTS_KEY)
 
-    def incrementar_contador(self) -> int:
-        return int(self._client.incr(COUNTER_KEY))
-
     def contador_atual(self) -> int:
         return int(self._client.get(COUNTER_KEY) or 0)
 
     def adquirir_slot_rps(self):
-        """
-        Controle de taxa: bloqueia ate haver slot na janela de 1 segundo.
-        Garante no maximo MAX_RPS requisicoes por segundo no total,
-        usando uma chave Redis por segundo como contador atomico.
-        """
+        """Bloqueia até haver slot disponível na janela de 1 segundo."""
         while True:
             agora = time.time()
             seg = int(agora)
@@ -118,20 +132,18 @@ class GerenciadorRedis:
 
             pipe = self._client.pipeline()
             pipe.incr(chave)
-            pipe.expire(chave, 2)  # expira apos 2s para nao acumular lixo
+            pipe.expire(chave, 2)
             count, _ = pipe.execute()
 
             if count <= MAX_RPS:
-                return  # slot disponivel
+                return
 
-            # Aguarda o restante do segundo atual antes de tentar novamente
             espera = 1.0 - (agora - seg) + 0.02
             time.sleep(max(0.05, espera))
 
 
 # ============================================================================
 # Classe: CarregadorExcel
-# Responsabilidade: ler o Excel de entrada e normalizar os numeros
 # ============================================================================
 class CarregadorExcel:
 
@@ -140,11 +152,6 @@ class CarregadorExcel:
         self._gerenciador = gerenciador
 
     def carregar(self) -> int:
-        """
-        Le a planilha a partir da linha 2 (linha 1 = cabecalho),
-        normaliza os numeros (apenas digitos) e os enfileira no Redis.
-        Retorna a quantidade de numeros carregados.
-        """
         self._gerenciador.limpar_estado()
 
         wb = openpyxl.load_workbook(self._caminho, read_only=True, data_only=True)
@@ -167,7 +174,6 @@ class CarregadorExcel:
 
 # ============================================================================
 # Classe: SalvadorExcel
-# Responsabilidade: gravar o Excel de saida com os numeros validos
 # ============================================================================
 class SalvadorExcel:
 
@@ -196,7 +202,6 @@ class SalvadorExcel:
 
 # ============================================================================
 # Classe: Worker
-# Responsabilidade: consumir a fila e consultar a API Node.js
 # ============================================================================
 class Worker:
 
@@ -217,50 +222,62 @@ class Worker:
 
         while not self._stop_event.is_set():
 
-            # ── Aguarda pausa global, se ativa ─────────────────────────────────
-            # PAUSE_EVENT.is_set() == True significa que a pausa está ativa.
-            while PAUSE_EVENT.is_set():
-                time.sleep(0.1)
+            # ── 1. Aguarda pausa, se ativa ──────────────────────────────────────
+            # RUNNING_EVENT.wait() bloqueia enquanto o evento estiver limpo
+            # (pausa ativa) e retorna imediatamente quando for setado (retomada).
+            RUNNING_EVENT.wait()
 
-            # ── Pega um número do Redis (bloqueante, timeout 2s) ───────────────
+            # ── 2. Pega próximo número da fila ──────────────────────────────────
             item = self._gerenciador.client.blpop(QUEUE_KEY, timeout=2)
             if item is None:
-                # Fila vazia -> encerra
+                # Fila vazia → encerra worker
                 break
+
             numero_com_tentativas = item[1]
             numero, tentativas = numero_com_tentativas.split(":")
             tentativas = int(tentativas)
 
-            # ── Adquire slot de rate-limit global ───────────────────────────────
+            # ── 3. Rate-limit global ────────────────────────────────────────────
             self._gerenciador.adquirir_slot_rps()
 
-            # ── Chama a API Node.js ────────────────────────────────────────────
+            # ── 4. Consulta API Node.js ─────────────────────────────────────────
             self._consultar(numero, tentativas)
 
-            # ── Incrementa o contador global de consultas (atomico no Redis) ───
+            # ── 5. Incrementa contador global (atômico no Redis) ─────────────────
             total = self._gerenciador.client.incr(COUNTER_KEY)
             restantes = max(0, self._total - total)
             print(
-                f"[Worker {self._session_id}] Progresso: {total}/{self._total}  | {restantes} Restantes"
+                f"[Worker {self._session_id}] Progresso: {total}/{self._total}"
+                f"  | {restantes} Restantes"
             )
 
-            # ── Delay aleatório entre requests para simular comportamento humano ──
-            delay = random.uniform(1.5, 4.0)
-            time.sleep(delay)
+            # ── 6. Delay interruptível ──────────────────────────────────────────
+            # Se uma pausa começar durante esse sleep, ele aborta imediatamente
+            # e o worker vai para o RUNNING_EVENT.wait() na próxima iteração.
+            _sleep_interruptivel(random.uniform(1.5, 4.0))
 
-            # ── Pausa global a cada BATCH_SIZE consultas ────────────────────────
-            # O Redis INCR é atômico: apenas UM worker recebe exatamente o valor
-            # múltiplo de BATCH_SIZE, então apenas ele ativa a pausa.
-            # Todos os outros workers verificam PAUSE_EVENT no início do loop
-            # e aguardam até a pausa terminar.
+            # ── 7. Checkpoint de pausa global a cada BATCH_SIZE consultas ────────
+            #
+            # PAUSE_LOCK.acquire(blocking=False):
+            #   - Se conseguir: este worker é o "dono" desta pausa — executa.
+            #   - Se não conseguir: outra pausa já está em andamento.
+            #     O worker simplesmente continua; o RUNNING_EVENT.wait()
+            #     no início da próxima iteração vai pará-lo.
+            #
             if total > 0 and total % BATCH_SIZE == 0:
-                print(
-                    f"\n[Sistema] {total} consultas realizadas -> pausa de {BATCH_DELAY}s...\n"
-                )
-                PAUSE_EVENT.set()  # sinaliza pausa para todos os workers
-                time.sleep(BATCH_DELAY)
-                PAUSE_EVENT.clear()  # libera todos os workers
-                print(f"\n[Sistema] Pausa encerrada. Retomando...\n")
+                if PAUSE_LOCK.acquire(blocking=False):
+                    try:
+                        print(
+                            f"\n[Sistema] {total} consultas realizadas"
+                            f" -> pausa de {BATCH_DELAY}s...\n"
+                        )
+                        RUNNING_EVENT.clear()  # para todos os workers
+                        time.sleep(BATCH_DELAY)  # o dono da pausa dorme
+                        RUNNING_EVENT.set()  # libera todos os workers
+                        print("\n[Sistema] Pausa encerrada. Retomando...\n")
+                    finally:
+                        PAUSE_LOCK.release()
+                # else: pausa já em curso — nada a fazer aqui
 
         print(f"[Worker {self._session_id}] Encerrado.")
 
@@ -289,7 +306,8 @@ class Worker:
 
             else:
                 print(
-                    f"[Worker {self._session_id}] HTTP {resp.status_code} para {numero} — recolocando na fila"
+                    f"[Worker {self._session_id}] HTTP {resp.status_code}"
+                    f" para {numero} — recolocando na fila"
                 )
                 self._gerenciador.reenfileirar(numero, tentativas)
 
@@ -309,7 +327,8 @@ class Worker:
 
         except Exception as exc:
             print(
-                f"[Worker {self._session_id}] Erro inesperado ({exc}) — recolocando {numero}"
+                f"[Worker {self._session_id}] Erro inesperado ({exc})"
+                f" — recolocando {numero}"
             )
             self._gerenciador.reenfileirar(numero, tentativas)
             time.sleep(2)
@@ -317,7 +336,6 @@ class Worker:
 
 # ============================================================================
 # Classe: Orquestrador
-# Responsabilidade: coordenar todo o fluxo de execucao
 # ============================================================================
 class Orquestrador:
 
@@ -327,20 +345,20 @@ class Orquestrador:
         self._gerenciador = GerenciadorRedis()
 
     def executar(self):
-        # 1. Carrega numeros no Redis
+        # 1. Carrega números no Redis
         carregador = CarregadorExcel(self._entrada, self._gerenciador)
         total = carregador.carregar()
         if total == 0:
             print("[Erro] Nenhum numero encontrado na planilha.")
             sys.exit(1)
 
-        # 2. Aguarda sessoes prontas
+        # 2. Aguarda sessões prontas
         sessoes_prontas = self._aguardar_sessoes(min_prontas=1)
         num_workers = min(NUM_SESSIONS, sessoes_prontas)
 
-        # 3. Inicia workers em threads separadas
-        # stop_event é usado APENAS para forçar parada antecipada (ex: Ctrl+C).
-        # Em operação normal, cada worker encerra sozinho quando a fila esvazia.
+        # 3. Inicia workers
+        # stop_event só é usado para parada forçada (Ctrl+C).
+        # Em operação normal cada worker encerra quando a fila esvazia.
         stop_event = threading.Event()
         threads = []
         for i in range(num_workers):
@@ -349,16 +367,14 @@ class Orquestrador:
             threads.append(t)
             t.start()
 
-        # 4. Aguarda todos concluirem (sem timeout fixo: a duração depende do volume)
+        # 4. Aguarda todos concluírem
         try:
             for t in threads:
                 t.join()
         except KeyboardInterrupt:
-            print(
-                "\n[Sistema] Interrompido pelo usuário. Aguardando workers encerrarem..."
-            )
+            print("\n[Sistema] Interrompido pelo usuário. Encerrando...")
             stop_event.set()
-            PAUSE_EVENT.clear()  # garante que workers não fiquem presos na pausa
+            RUNNING_EVENT.set()  # desbloqueia workers presos em wait()
             for t in threads:
                 t.join(timeout=10)
 
