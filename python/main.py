@@ -254,7 +254,7 @@ class Worker:
             # ── 6. Delay interruptível ──────────────────────────────────────────
             # Se uma pausa começar durante esse sleep, ele aborta imediatamente
             # e o worker vai para o RUNNING_EVENT.wait() na próxima iteração.
-            _sleep_interruptivel(random.uniform(1.5, 4.0))
+            _sleep_interruptivel(random.uniform(5.0, 7.5))
 
             # ── 7. Checkpoint de pausa global a cada BATCH_SIZE consultas ────────
             #
