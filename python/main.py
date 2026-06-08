@@ -164,7 +164,7 @@ class CarregadorExcel:
             raw = str(row[0]).strip()
             numero = "".join(c for c in raw if c.isdigit())
             if numero:
-                self._gerenciador.enfileirar(f"{numero}:0")
+                self._gerenciador.enfileirar(f"55{numero}:0")
                 count += 1
 
         wb.close()
@@ -186,18 +186,34 @@ class SalvadorExcel:
 
         os.makedirs(os.path.dirname(os.path.abspath(self._caminho)), exist_ok=True)
 
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = "WhatsApp Validos"
-        ws["A1"] = "Telefone"
+        # Abre arquivo existente ou cria um novo
+        if os.path.exists(self._caminho):
+            wb = openpyxl.load_workbook(self._caminho)
+            ws = wb.active
+        else:
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "WhatsApp Validos"
+            ws["A1"] = "Telefone"
 
-        for i, numero in enumerate(resultados, start=2):
-            ws[f"A{i}"] = numero
+        # Primeira linha vazia da coluna A
+        linha = 2
+        while ws[f"A{linha}"].value not in (None, ""):
+            linha += 1
+
+        # Salva novos números sem o DDI 55
+        adicionados = 0
+
+        for numero in resultados:
+            numero_sem_ddi = numero[2:] if numero.startswith("55") else numero
+
+            ws[f"A{linha}"] = numero_sem_ddi
+            linha += 1
+            adicionados += 1
 
         wb.save(self._caminho)
-        print(
-            f"[Resultado] {len(resultados)} numeros com WhatsApp salvos em: {self._caminho}"
-        )
+
+        print(f"[Resultado] {adicionados} numeros adicionados em: {self._caminho}")
 
 
 # ============================================================================
