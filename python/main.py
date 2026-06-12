@@ -32,19 +32,21 @@ import requests
 #   set()   = sistema rodando normalmente  (estado inicial)
 #   clear() = pausa ativa — todos os workers bloqueiam em .wait()
 #
-# PAUSE_LOCK:
-#   Garante que APENAS UM worker dispara a pausa por vez.
-#   Os outros workers que chegarem no checkpoint de batch durante uma pausa
-#   já em andamento simplesmente ignoram (a pausa os cobrirá via wait()).
 #
 # _sleep_interruptivel():
 #   Substitui time.sleep(delay) para que o delay seja abortado
 #   assim que uma pausa começar, sem esperar ele terminar.
 #
 # ─────────────────────────────────────────────────────────────────────────────
+# ── Controle de pausa global ─────────────────────────────────────────────────
 RUNNING_EVENT = threading.Event()
 RUNNING_EVENT.set()  # começa em estado "rodando"
-PAUSE_LOCK = threading.Lock()
+
+# NOVAS VARIÁVEIS PARA SINCRONIZAÇÃO EXATA DE LOTE:
+BATCH_LOCK = threading.Lock()
+DISPATCH_COUNT = 0  # Conta quantas consultas iniciaram no lote atual
+COMPLETED_COUNT = 0  # Conta quantas consultas terminaram no lote atual
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def _sleep_interruptivel(segundos: float) -> None:
@@ -234,19 +236,58 @@ class Worker:
         self._total = total
 
     def executar(self):
+        global DISPATCH_COUNT, COMPLETED_COUNT
         print(f"[Worker {self._session_id}] Iniciado.")
 
         while not self._stop_event.is_set():
 
-            # ── 1. Aguarda pausa, se ativa ──────────────────────────────────────
-            # RUNNING_EVENT.wait() bloqueia enquanto o evento estiver limpo
-            # (pausa ativa) e retorna imediatamente quando for setado (retomada).
+            # 1. Aguarda pausa geral, se ativa
             RUNNING_EVENT.wait()
+
+            # ── BARREIRA DE LOTE EXATO ──────────────────────────────────────────
+            with BATCH_LOCK:
+                if DISPATCH_COUNT >= BATCH_SIZE:
+                    # O limite foi atingido. Aguarda os workers em andamento
+                    # terminarem suas consultas deste lote para não ter "sobras".
+                    while COMPLETED_COUNT < BATCH_SIZE:
+                        if self._stop_event.is_set():
+                            break
+                        # Libera o lock rápido para outros workers conseguirem registrar a conclusão
+                        BATCH_LOCK.release()
+                        time.sleep(0.1)
+                        BATCH_LOCK.acquire()
+
+                    if self._stop_event.is_set():
+                        break
+
+                    # Trava os workers no início do loop
+                    RUNNING_EVENT.clear()
+
+                    total_atual = self._gerenciador.contador_atual()
+                    print(
+                        f"\n[Sistema] {total_atual} consultas realizadas -> pausa de {BATCH_DELAY}s...\n"
+                    )
+
+                    time.sleep(
+                        BATCH_DELAY
+                    )  # Faz a pausa exata sem ninguém consultar nada
+
+                    # Reseta os contadores para o próximo ciclo
+                    DISPATCH_COUNT = 0
+                    COMPLETED_COUNT = 0
+                    RUNNING_EVENT.set()  # Libera a continuação
+                    print("\n[Sistema] Pausa encerrada. Retomando...\n")
+
+                # Registra que este worker vai despachar uma nova consulta agora
+                DISPATCH_COUNT += 1
+            # ────────────────────────────────────────────────────────────────────
 
             # ── 2. Pega próximo número da fila ──────────────────────────────────
             item = self._gerenciador.client.blpop(QUEUE_KEY, timeout=2)
             if item is None:
-                # Fila vazia → encerra worker
+                # Fila vazia → reverte o despacho e encerra worker
+                with BATCH_LOCK:
+                    DISPATCH_COUNT -= 1
                 break
 
             numero_com_tentativas = item[1]
@@ -259,7 +300,7 @@ class Worker:
             # ── 4. Consulta API Node.js ─────────────────────────────────────────
             self._consultar(numero, tentativas)
 
-            # ── 5. Incrementa contador global (atômico no Redis) ─────────────────
+            # ── 5. Incrementa contador global (atômico no Redis) ────────────────
             total = self._gerenciador.client.incr(COUNTER_KEY)
             restantes = max(0, self._total - total)
             print(
@@ -267,33 +308,13 @@ class Worker:
                 f"  | {restantes} Restantes"
             )
 
-            # ── 6. Delay interruptível ──────────────────────────────────────────
-            # Se uma pausa começar durante esse sleep, ele aborta imediatamente
-            # e o worker vai para o RUNNING_EVENT.wait() na próxima iteração.
-            _sleep_interruptivel(random.uniform(5.0, 7.5))
+            # ── MARCA CONCLUSÃO ─────────────────────────────────────────────────
+            # Avisa a barreira do lote que essa consulta finalizou 100%
+            with BATCH_LOCK:
+                COMPLETED_COUNT += 1
 
-            # ── 7. Checkpoint de pausa global a cada BATCH_SIZE consultas ────────
-            #
-            # PAUSE_LOCK.acquire(blocking=False):
-            #   - Se conseguir: este worker é o "dono" desta pausa — executa.
-            #   - Se não conseguir: outra pausa já está em andamento.
-            #     O worker simplesmente continua; o RUNNING_EVENT.wait()
-            #     no início da próxima iteração vai pará-lo.
-            #
-            if total > 0 and total % BATCH_SIZE == 0:
-                if PAUSE_LOCK.acquire(blocking=False):
-                    try:
-                        print(
-                            f"\n[Sistema] {total} consultas realizadas"
-                            f" -> pausa de {BATCH_DELAY}s...\n"
-                        )
-                        RUNNING_EVENT.clear()  # para todos os workers
-                        time.sleep(BATCH_DELAY)  # o dono da pausa dorme
-                        RUNNING_EVENT.set()  # libera todos os workers
-                        print("\n[Sistema] Pausa encerrada. Retomando...\n")
-                    finally:
-                        PAUSE_LOCK.release()
-                # else: pausa já em curso — nada a fazer aqui
+            # ── 6. Delay interruptível ──────────────────────────────────────────
+            _sleep_interruptivel(random.uniform(5.0, 7.5))
 
         print(f"[Worker {self._session_id}] Encerrado.")
 
