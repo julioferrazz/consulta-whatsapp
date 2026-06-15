@@ -8,7 +8,7 @@ REDIS_PASSWORD = None  # None = sem senha; coloque a senha aqui se houver
 
 # ── API Node.js ──────────────────────────────────────────────────────────────
 NODE_API_URL = "http://localhost:3000"
-NUM_SESSIONS = 2  # deve ser igual ao NUM_SESSIONS no index.js
+NUM_SESSIONS = 3  # deve ser igual ao NUM_SESSIONS no index.js
 
 # ── Controle de taxa ─────────────────────────────────────────────────────────
 MAX_RPS = 1  # maximo de consultas por segundo (total, todos workers)

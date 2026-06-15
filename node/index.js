@@ -35,7 +35,7 @@ try {
 // Configuracoes
 // ---------------------------------------------------------------------------
 const PORT = 3000;
-const NUM_SESSIONS = 2;
+const NUM_SESSIONS = 3;
 const SESSIONS_DIR = path.join(__dirname, 'sessions');
 
 // ---------------------------------------------------------------------------
